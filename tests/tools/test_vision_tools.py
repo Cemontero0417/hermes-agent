@@ -1248,3 +1248,70 @@ class TestVisionFanoutConcurrencyCap:
             "control failed: peak did not exceed CAP even without a real cap "
             f"(peak={peak})"
         )
+
+    def test_acquire_executor_is_dedicated_and_sized_to_cap(self):
+        """The slot-acquire executor must be dedicated, not the shared default.
+
+        The blocking semaphore acquire is offloaded to a private
+        ThreadPoolExecutor sized to the cap — NOT ``run_in_executor(None, ...)``
+        — so a large queued fan-out can't park blocked threads in the default
+        pool the gateway and web server share.
+        """
+        import importlib
+        from concurrent.futures import ThreadPoolExecutor
+
+        vt = importlib.import_module("tools.vision_tools")
+        assert isinstance(vt._vision_acquire_executor, ThreadPoolExecutor)
+        assert (
+            vt._vision_acquire_executor._max_workers == vt._VISION_MAX_CONCURRENCY
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquire_runs_on_dedicated_executor_not_default_pool(self):
+        """Every slot acquire must execute on a ``vision-acquire`` thread.
+
+        Regression guard: offloading the acquire to the shared default executor
+        would let a fan-out starve the gateway/web-server pool. Assert the
+        acquire callable actually runs on a thread from the dedicated executor.
+        """
+        import asyncio
+        import importlib
+        import threading
+
+        vt = importlib.import_module("tools.vision_tools")
+
+        CAP = 2
+        acquire_threads: list[str] = []
+        real_sem = threading.BoundedSemaphore(CAP)
+
+        class _TrackingSem:
+            @staticmethod
+            def acquire(*a, **k):
+                acquire_threads.append(threading.current_thread().name)
+                return real_sem.acquire(*a, **k)
+
+            @staticmethod
+            def release(*a, **k):
+                return real_sem.release(*a, **k)
+
+        async def fake_native(image_url, question):
+            await asyncio.sleep(0.02)
+            return json.dumps({"ok": True})
+
+        N = 8
+        with (
+            patch.object(vt, "_vision_concurrency_semaphore", _TrackingSem),
+            patch.object(vt, "_should_use_native_vision_fast_path", return_value=True),
+            patch.object(vt, "_vision_analyze_native", side_effect=fake_native),
+        ):
+            await asyncio.gather(*[
+                vt._handle_vision_analyze(
+                    {"image_url": f"https://example.com/frame_{i}.png",
+                     "question": "what is this"}
+                )
+                for i in range(N)
+            ])
+
+        assert len(acquire_threads) == N
+        leaked = [name for name in acquire_threads if not name.startswith("vision-acquire")]
+        assert not leaked, f"acquire leaked off the dedicated executor: {leaked}"

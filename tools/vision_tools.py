@@ -32,6 +32,7 @@ import base64
 import contextlib
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import uuid
@@ -159,6 +160,20 @@ def _resolve_vision_max_concurrency() -> int:
 
 _VISION_MAX_CONCURRENCY = _resolve_vision_max_concurrency()
 _vision_concurrency_semaphore = threading.BoundedSemaphore(_VISION_MAX_CONCURRENCY)
+
+# Dedicated executor for the (blocking) semaphore acquire. We do NOT offload the
+# acquire to the default executor (run_in_executor(None, ...)) because that pool
+# is shared with the gateway and web server — a large queued fan-out (e.g. 30
+# video frames) would park 30 threads blocked on .acquire() there and starve
+# those callers, re-creating the very loop-pressure this cap exists to prevent.
+# Sizing the pool to the cap means at most _VISION_MAX_CONCURRENCY acquire-waiters
+# ever run concurrently; further waiters queue on this executor's work queue
+# rather than spawning unbounded blocked threads, and the starvation is contained
+# to vision itself instead of leaking into shared infrastructure.
+_vision_acquire_executor = ThreadPoolExecutor(
+    max_workers=_VISION_MAX_CONCURRENCY,
+    thread_name_prefix="vision-acquire",
+)
 
 
 def _image_url_shape_ok(url: str) -> bool:
@@ -777,15 +792,19 @@ async def _vision_concurrency_slot():
     """Hold one process-global vision-concurrency slot for the duration.
 
     Acquires :data:`_vision_concurrency_semaphore` before yielding and always
-    releases it on exit. The blocking acquire is offloaded to a worker thread
-    via ``run_in_executor`` so that waiting for a slot never blocks the calling
-    event loop (callers run on per-thread loops; blocking the acquire on the
-    loop thread would freeze that loop's other tasks while we wait). The
-    semaphore is a ``BoundedSemaphore`` so a double-release would raise rather
-    than silently inflate the limit.
+    releases it on exit. The blocking acquire is offloaded to a dedicated
+    worker thread (:data:`_vision_acquire_executor`, NOT the shared default
+    executor) so that waiting for a slot never blocks the calling event loop
+    (callers run on per-thread loops; blocking the acquire on the loop thread
+    would freeze that loop's other tasks while we wait) AND a large queued
+    fan-out can't park unbounded blocked threads in the pool the gateway/web
+    server share. The semaphore is a ``BoundedSemaphore`` so a double-release
+    would raise rather than silently inflate the limit.
     """
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _vision_concurrency_semaphore.acquire)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        _vision_acquire_executor, _vision_concurrency_semaphore.acquire
+    )
     try:
         yield
     finally:
